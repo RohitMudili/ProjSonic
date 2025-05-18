@@ -13,6 +13,8 @@ import io
 import base64
 import asyncio
 from livekit_client import LiveKitClient
+import re
+import queue
 
 # Load environment variables
 load_dotenv()
@@ -21,17 +23,13 @@ load_dotenv()
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SIZE = 1024
-RECORD_SECONDS = 5
-TOKEN_SERVER_URL = "http://localhost:5000"  # Update this if your token server is hosted elsewhere
+ENERGY_THRESHOLD = 0.01  # Adjust this value based on your microphone
+SILENCE_DURATION = 1.0  # Stop after 1 second of silence
+TOKEN_SERVER_URL = "http://localhost:5000"
 
 class VoiceAssistant:
     def __init__(self):
         # Load and validate API keys
-        self.deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
-        if not self.deepgram_api_key:
-            st.error("Deepgram API key not found. Please check your .env file.")
-            st.stop()
-            
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
             st.error("OpenAI API key not found. Please check your .env file.")
@@ -39,6 +37,8 @@ class VoiceAssistant:
             
         self.tts_api_key = os.getenv("TTS_API_KEY")
         self.tts_api_base_url = os.getenv("TTS_API_BASE_URL")
+        
+        self.alphavantage_api_key = os.getenv("ALPHAVANTAGE_API_KEY")
         
         # Initialize LiveKit client (will be set up when connecting)
         self.livekit_client = None
@@ -70,75 +70,124 @@ class VoiceAssistant:
             self.livekit_connected = False
 
     def transcribe_audio(self, audio_data):
-        """Send audio to Deepgram for transcription"""
+        """Send audio to OpenAI Whisper for transcription"""
         try:
-            # Use REST API for transcription
-            url = "https://api.deepgram.com/v1/listen"
+            # Ensure audio_data is a numpy array
+            if not isinstance(audio_data, np.ndarray):
+                st.error("Audio data must be a numpy array")
+                return None
+            
+            # Normalize audio data to int16 range (-32768 to 32767)
+            if audio_data.dtype != np.int16:
+                # First normalize to float between -1 and 1
+                audio_data = audio_data.astype(np.float32)
+                if np.abs(audio_data).max() > 1.0:
+                    audio_data = audio_data / np.abs(audio_data).max()
+                # Then convert to int16
+                audio_data = (audio_data * 32767).astype(np.int16)
+            
+            # Create a BytesIO object to store the WAV file
+            wav_buffer = io.BytesIO()
+            
+            # Write the audio data to the buffer as a WAV file
+            write(wav_buffer, SAMPLE_RATE, audio_data)
+            
+            # Reset buffer position
+            wav_buffer.seek(0)
+            
+            # Debug information
+            st.write(f"Audio data shape: {audio_data.shape}")
+            st.write(f"Audio data type: {audio_data.dtype}")
+            st.write(f"Audio data min/max: {audio_data.min()}/{audio_data.max()}")
+            st.write(f"WAV buffer size: {len(wav_buffer.getvalue())} bytes")
+            
+            # Verify WAV buffer is not empty
+            if len(wav_buffer.getvalue()) == 0:
+                st.error("Generated WAV file is empty")
+                return None
+            
+            url = "https://api.openai.com/v1/audio/transcriptions"
             headers = {
-                "Authorization": f"Token {self.deepgram_api_key}",
-                "Content-Type": "audio/wav"
+                "Authorization": f"Bearer {self.openai_api_key}"
+            }
+            files = {
+                "file": ("audio.wav", wav_buffer, "audio/wav"),
+                "model": (None, "whisper-1")
             }
             
-            st.write("Sending request to Deepgram...")
-            response = requests.post(url, headers=headers, data=audio_data)
+            # Debug: Print request details
+            st.write("Sending request to OpenAI API...")
+            
+            response = requests.post(url, headers=headers, files=files)
             
             if response.status_code != 200:
-                st.error(f"Deepgram API error: {response.status_code} - {response.text}")
+                st.error(f"OpenAI API error: {response.status_code} - {response.text}")
                 return None
                 
             result = response.json()
-            st.write("Received response from Deepgram")
-            
-            # Debug: Print response
-            st.write("Response:", result)
-            
-            if "results" in result and result["results"].get("channels"):
-                channels = result["results"]["channels"]
-                if channels and channels[0].get("alternatives"):
-                    return channels[0]["alternatives"][0].get("transcript", "")
-            
+            if "text" in result:
+                return result["text"]
             st.error("Could not find transcript in response")
             return None
             
         except Exception as e:
             st.error(f"Error during transcription: {str(e)}")
+            st.error(f"Error type: {type(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+            return None
+
+    def get_stock_price(self, symbol):
+        url = f"https://www.alphavantage.co/query"
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol,
+            "apikey": self.alphavantage_api_key
+        }
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            try:
+                price = data["Global Quote"]["05. price"]
+                return price
+            except KeyError:
+                return None
+        else:
             return None
 
     def get_llm_response(self, text):
-        """Get response from OpenAI"""
+        """Get response from OpenAI, with Alpha Vantage integration for stock prices."""
         if not text:
             return "I couldn't understand the audio. Please try again."
-            
+        stock_match = re.search(r"stock price of ([A-Za-z]+)", text, re.IGNORECASE)
+        if stock_match and self.alphavantage_api_key:
+            symbol = stock_match.group(1).upper()
+            price = self.get_stock_price(symbol)
+            if price:
+                text = f"The current price of {symbol} is {price} USD. {text}"
+            else:
+                text = f"I could not retrieve the price for {symbol}. {text}"
         try:
             headers = {
                 "Authorization": f"Bearer {self.openai_api_key}",
                 "Content-Type": "application/json"
             }
-            
             data = {
                 "model": "gpt-3.5-turbo",
                 "messages": [
+                    {"role": "system", "content": "You are a financial assistant. Always provide market data in numbers when possible."},
                     {"role": "user", "content": text}
                 ],
-                "max_tokens": 150
+                "max_tokens": 100
             }
-            
-            st.write("Sending request to OpenAI...")
-            st.write("Using endpoint: https://api.openai.com/v1/chat/completions")
-            
             response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=data
             )
-            
-            st.write(f"OpenAI Response Status: {response.status_code}")
-            st.write(f"OpenAI Response Text: {response.text[:200]}...")  # Show first 200 chars for debugging
-            
             if response.status_code != 200:
                 st.error(f"OpenAI API error: {response.status_code} - {response.text}")
                 return "Sorry, I encountered an error while processing your request."
-            
             try:
                 response_json = response.json()
                 if "choices" in response_json and len(response_json["choices"]) > 0:
@@ -148,39 +197,30 @@ class VoiceAssistant:
                     return "Sorry, I couldn't process the response properly."
             except json.JSONDecodeError as e:
                 st.error(f"Failed to parse OpenAI response: {str(e)}")
-                st.error(f"Raw response: {response.text[:200]}...")
                 return "Sorry, I couldn't understand the response from the AI."
-                
         except Exception as e:
             st.error(f"Error getting OpenAI response: {str(e)}")
             return "Sorry, I encountered an error while processing your request."
 
     def text_to_speech(self, text):
-        """Convert text to speech using ElevenLabs"""
+        """Convert text to speech using OpenAI TTS (voice: alloy)"""
         if not text:
             return None
-            
         try:
             headers = {
-                "xi-api-key": self.tts_api_key,
+                "Authorization": f"Bearer {self.tts_api_key}",
                 "Content-Type": "application/json"
             }
-            
             data = {
-                "text": text,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.5
-                }
+                "model": "tts-1",
+                "input": text,
+                "voice": "alloy"
             }
-            
             response = requests.post(
-                f"{self.tts_api_base_url}/text-to-speech/21m00Tcm4TlvDq8ikWAM",
+                self.tts_api_base_url,
                 headers=headers,
                 json=data
             )
-            
             if response.status_code == 200:
                 return response.content
             else:
@@ -191,43 +231,66 @@ class VoiceAssistant:
             return None
 
 async def record_audio(assistant):
-    """Record audio from microphone and stream to LiveKit if available"""
-    st.write("Recording...")
+    """Record audio from microphone with energy-based voice activity detection"""
+    st.write("Recording... (Speak to start, silence to stop)")
     
-    if assistant.livekit_client and assistant.livekit_connected:
-        # Use LiveKit for real-time streaming
-        audio_data = sd.rec(
-            int(RECORD_SECONDS * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=np.int16,
-            callback=lambda indata, frames, time, status: 
-                asyncio.run(assistant.livekit_client.publish_audio(indata))
-        )
+    # Create a queue for audio chunks
+    audio_queue = queue.Queue()
+    recording = True
+    audio_chunks = []
+    silence_start = None
+    
+    def audio_callback(indata, frames, time, status):
+        if status:
+            st.error(f"Audio callback error: {status}")
+        audio_queue.put(indata.copy())
+    
+    # Start recording
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype=np.float32,
+        blocksize=CHUNK_SIZE,
+        callback=audio_callback
+    )
+    
+    with stream:
+        while recording:
+            # Get audio chunk
+            chunk = audio_queue.get()
+            
+            # Calculate energy (RMS) of the chunk
+            energy = np.sqrt(np.mean(chunk**2))
+            
+            # Check if chunk contains speech
+            is_speech = energy > ENERGY_THRESHOLD
+            
+            if is_speech:
+                audio_chunks.append(chunk)
+                silence_start = None
+            else:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start > SILENCE_DURATION:
+                    recording = False
+                
+                # Still add the chunk to maintain continuity
+                audio_chunks.append(chunk)
+            
+            # Update progress
+            st.write(f"Recording... {'Speaking' if is_speech else 'Silence'} (Energy: {energy:.4f})")
+            await asyncio.sleep(0.01)  # Small delay to prevent UI freezing
+    
+    # Combine all chunks and convert to int16
+    if audio_chunks:
+        audio_data = np.concatenate(audio_chunks)
+        # Convert to int16
+        audio_data = (audio_data * 32767).astype(np.int16)
+        st.write("Recording complete!")
+        return audio_data
     else:
-        # Fallback to regular recording
-        audio_data = sd.rec(
-            int(RECORD_SECONDS * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=np.int16
-        )
-    
-    # Create a progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Update progress bar during recording
-    for i in range(RECORD_SECONDS):
-        progress_bar.progress((i + 1) / RECORD_SECONDS)
-        status_text.text(f"Recording... {RECORD_SECONDS - i} seconds remaining")
-        await asyncio.sleep(1)
-    
-    sd.wait()  # Wait until recording is finished
-    status_text.text("Recording complete!")
-    progress_bar.progress(1.0)
-    
-    return audio_data
+        st.error("No audio recorded")
+        return None
 
 def save_audio(audio_data, filename):
     """Save audio data to WAV file"""
@@ -279,13 +342,6 @@ async def main():
     # Display API key status
     st.sidebar.write("API Key Status:")
     
-    # Deepgram
-    deepgram_key = st.session_state.assistant.deepgram_api_key
-    if deepgram_key:
-        st.sidebar.success(f"Deepgram API key: {deepgram_key[:8]}...")
-    else:
-        st.sidebar.error("No Deepgram API key found")
-    
     # OpenAI
     openai_key = st.session_state.assistant.openai_api_key
     if openai_key:
@@ -318,40 +374,30 @@ async def main():
                 st.write("Starting recording...")
                 audio_data = await record_audio(st.session_state.assistant)
                 
-                # Save audio
-                save_audio(audio_data, "temp.wav")
-                
-                # Process audio
-                with open("temp.wav", "rb") as f:
-                    audio_bytes = f.read()
-                    st.write(f"Audio file size: {len(audio_bytes)} bytes")
-                
-                # Transcribe
-                st.write("Starting transcription...")
-                transcription_start = time.time()
-                st.session_state.transcript = st.session_state.assistant.transcribe_audio(audio_bytes)
-                st.session_state.latencies['transcription'] = time.time() - transcription_start
-                
-                if st.session_state.transcript:
-                    st.write("Transcription:", st.session_state.transcript)
+                if audio_data is not None:
+                    # Process audio
+                    st.write("Starting transcription...")
+                    transcription_start = time.time()
+                    st.session_state.transcript = st.session_state.assistant.transcribe_audio(audio_data)
+                    st.session_state.latencies['transcription'] = time.time() - transcription_start
                     
-                    # Get LLM response
-                    st.write("Getting AI response...")
-                    llm_start = time.time()
-                    st.session_state.response = st.session_state.assistant.get_llm_response(st.session_state.transcript)
-                    st.session_state.latencies['llm'] = time.time() - llm_start
-                    
-                    # Convert to speech
-                    st.write("Converting to speech...")
-                    tts_start = time.time()
-                    st.session_state.audio_response = st.session_state.assistant.text_to_speech(st.session_state.response)
-                    st.session_state.latencies['tts'] = time.time() - tts_start
-                    
-                    # Calculate total time
-                    st.session_state.latencies['total'] = time.time() - start_time
-                    
-                    # Save transcription and response
-                    save_transcription(st.session_state.transcript, st.session_state.response)
+                    if st.session_state.transcript:
+                        st.write("Transcription:", st.session_state.transcript)
+                        
+                        # Get LLM response
+                        st.write("Getting AI response...")
+                        llm_start = time.time()
+                        st.session_state.response = st.session_state.assistant.get_llm_response(st.session_state.transcript)
+                        st.session_state.latencies['llm'] = time.time() - llm_start
+                        
+                        # Convert to speech
+                        st.write("Converting to speech...")
+                        tts_start = time.time()
+                        st.session_state.audio_response = st.session_state.assistant.text_to_speech(st.session_state.response)
+                        st.session_state.latencies['tts'] = time.time() - tts_start
+                        
+                        # Calculate total time
+                        st.session_state.latencies['total'] = time.time() - start_time
             except Exception as e:
                 st.error(f"Error in main processing: {str(e)}")
     
@@ -367,7 +413,15 @@ async def main():
                 
                 if st.session_state.audio_response:
                     st.subheader("Audio Response")
-                    st.audio(st.session_state.audio_response, format="audio/mp3")
+                    audio_bytes = st.session_state.audio_response
+                    b64 = base64.b64encode(audio_bytes).decode()
+                    md = f'''
+                        <audio controls autoplay>
+                            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                            Your browser does not support the audio element.
+                        </audio>
+                    '''
+                    st.markdown(md, unsafe_allow_html=True)
         
         # Display latencies
         if st.session_state.latencies['total'] is not None:

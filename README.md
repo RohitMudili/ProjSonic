@@ -4,7 +4,7 @@ A real-time voice conversation application with AI capabilities, built using Str
 
 ## Features
 
-- Real-time voice recording and transcription
+- Real-time voice recording and transcription using OpenAI Whisper
 - AI-powered conversation using OpenAI's GPT-3.5
 - Text-to-speech response using ElevenLabs
 - LiveKit integration for real-time audio streaming
@@ -14,8 +14,7 @@ A real-time voice conversation application with AI capabilities, built using Str
 ## Prerequisites
 
 - Python 3.8 or higher
-- Deepgram API key
-- OpenAI API key
+- OpenAI API key (for both speech-to-text and chat)
 - ElevenLabs API key
 - LiveKit server (optional)
 
@@ -40,7 +39,6 @@ pip install -r requirements.txt
 
 4. Create a `.env` file in the project root with your API keys:
 ```
-DEEPGRAM_API_KEY=your_deepgram_api_key
 OPENAI_API_KEY=your_openai_api_key
 TTS_API_KEY=your_elevenlabs_api_key
 TTS_API_BASE_URL=https://api.elevenlabs.io/v1
